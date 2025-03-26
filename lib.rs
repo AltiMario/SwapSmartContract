@@ -4,7 +4,12 @@
 mod swap_contract {
     use ink::storage::Mapping;
 
-    /// Represents a swap between two parties
+    /// Represents a swap agreement between two parties
+    /// # Fields
+    /// - initiator: Account that created the swap
+    /// - counterparty: Account that can accept the swap
+    /// - initiator_asset: Amount of native token deposited by initiator
+    /// - counterparty_asset: Required amount from counterparty to complete swap
     #[derive(scale::Decode, scale::Encode)]
     #[cfg_attr(
         feature = "std",
@@ -17,25 +22,35 @@ mod swap_contract {
         counterparty_asset: Balance,
     }
 
-    /// Defines the storage of the contract
+    /// Main contract storage structure
     #[ink(storage)]
     pub struct SwapContract {
-        /// Mapping from swap ID to Swap struct
+        /// Stores all active swaps by ID
         swaps: Mapping<u32, Swap>,
-        /// Counter for generating unique swap IDs
+        /// Auto-incrementing ID counter for new swaps
         next_swap_id: u32,
+        reentrancy_guard: bool, // Add this line
     }
 
-    /// Custom errors for the swap contract
+    /// Custom error types for swap operations
     #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub enum Error {
-        SwapNotFound,
-        NotAuthorized,
-        InsufficientBalance,
+        /// Requested swap ID does not exist
+        SwapNotFound = 0,
+        /// Caller is not authorized for this operation
+        NotAuthorized = 1,
+        /// Initiator's deposit is zero or insufficient
+        InsufficientInitiatorBalance = 2,
+        /// Counterparty's deposit is insufficient
+        InsufficientCounterpartyBalance = 3,
+        /// Swap ID overflow occurred
+        SwapIdOverflow = 4,
+        /// Reentrancy detected
+        Reentrancy = 5,
     }
 
-    /// Event emitted when a new swap is initiated
+    /// Emitted when a new swap is created
     #[ink(event)]
     pub struct SwapInitiated {
         #[ink(topic)]
@@ -46,43 +61,111 @@ mod swap_contract {
         counterparty_asset: Balance,
     }
 
-    /// Event emitted when a swap is accepted
+    /// Emitted when a swap is successfully completed
     #[ink(event)]
     pub struct SwapAccepted {
         #[ink(topic)]
         swap_id: u32,
     }
 
-    /// Event emitted when a swap is cancelled
+    /// Emitted when a swap is canceled by initiator
     #[ink(event)]
     pub struct SwapCancelled {
         #[ink(topic)]
         swap_id: u32,
     }
 
-    impl SwapContract {
-        /// Constructor to initialize the contract
-        #[ink(constructor)]
-        pub fn new() -> Self {
+    //----------------------------------
+    // Default Implementation
+    //----------------------------------
+    /// Provides default initialization values for the contract.
+    ///
+    /// When the contract is first deployed, it starts with no assets locked and no locker.
+    impl Default for SwapContract {
+        fn default() -> Self {
             Self {
                 swaps: Mapping::default(),
                 next_swap_id: 0,
+                reentrancy_guard: false,
             }
         }
+    }
 
-        /// Initiates a new swap
+    impl SwapContract {
+        /// Creates a new swap contract with empty state
+        #[ink(constructor)]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Transfers funds to the specified account
+        /// # Arguments
+        /// - `to`: The account to transfer funds to
+        /// - `amount`: The amount of funds to transfer
+        /// # Returns
+        /// - `Ok(())`: If the transfer was successful
+        /// - `Err(Error::InsufficientBalance)`: If the transfer failed due to insufficient balance
+        fn transfer_funds(&self, to: AccountId, amount: Balance) -> Result<(), Error> {
+            self.env().transfer(to, amount).map_err(|_| Error::InsufficientCounterpartyBalance)
+        }
+
+        /// Emits an event indicating that a new swap has been initiated
+        /// # Arguments
+        /// - `swap_id`: The ID of the newly created swap
+        /// - `initiator`: The account that initiated the swap
+        /// - `counterparty`: The account that can accept the swap
+        /// - `initiator_asset`: The amount of native token deposited by the initiator
+        /// - `counterparty_asset`: The required amount from the counterparty to complete the swap
+        fn emit_swap_initiated(&self, swap_id: u32, initiator: AccountId, counterparty: AccountId, initiator_asset: Balance, counterparty_asset: Balance) {
+            self.env().emit_event(SwapInitiated {
+                swap_id,
+                initiator,
+                counterparty,
+                initiator_asset,
+                counterparty_asset,
+            });
+        }
+
+        /// Emits an event indicating that a swap has been accepted
+        /// # Arguments
+        /// - `swap_id`: The ID of the accepted swap
+        fn emit_swap_accepted(&self, swap_id: u32) {
+            self.env().emit_event(SwapAccepted { swap_id });
+        }
+
+        /// Emits an event indicating that a swap has been cancelled
+        /// # Arguments
+        /// - `swap_id`: The ID of the cancelled swap
+        fn emit_swap_cancelled(&self, swap_id: u32) {
+            self.env().emit_event(SwapCancelled { swap_id });
+        }
+
+        /// Creates a new swap agreement
+        /// # Arguments
+        /// - counterparty: Account that can accept the swap
+        /// - counterparty_asset: Required deposit from counterparty
+        /// # Returns
+        /// - Ok(u32): Newly created swap ID
+        /// - Err(Error): Failure reason
+        /// # Note
+        /// Caller must send native tokens equal to initiator_asset
         #[ink(message, payable)]
-        pub fn initiate_swap(&mut self, counterparty: AccountId, counterparty_asset: Balance) -> Result<u32, Error> {
+        pub fn initiate_swap(
+            &mut self,
+            counterparty: AccountId,
+            counterparty_asset: Balance
+        ) -> Result<u32, Error> {
             let initiator = self.env().caller();
             let initiator_asset = self.env().transferred_value();
 
-            // Ensure the initiator has sufficient balance
-            if self.env().balance() < initiator_asset {
-                return Err(Error::InsufficientBalance);
+            // Validate initiator's deposit
+            if initiator_asset == 0 {
+                return Err(Error::InsufficientInitiatorBalance);
             }
 
             let swap_id = self.next_swap_id;
-            self.next_swap_id += 1;
+            self.next_swap_id = swap_id.checked_add(1)
+                .ok_or(Error::SwapIdOverflow)?;
 
             let swap = Swap {
                 initiator,
@@ -93,91 +176,132 @@ mod swap_contract {
 
             self.swaps.insert(swap_id, &swap);
 
-            // Emit the SwapInitiated event
-            self.env().emit_event(SwapInitiated {
-                swap_id,
-                initiator,
-                counterparty,
-                initiator_asset,
-                counterparty_asset,
-            });
+            self.emit_swap_initiated(swap_id, initiator, counterparty, initiator_asset, counterparty_asset);
 
             Ok(swap_id)
         }
 
-        /// Accepts an existing swap
+        /// Completes an existing swap agreement
+        /// # Arguments
+        /// - swap_id: ID of swap to complete
+        /// # Returns
+        /// - Ok(()): Success
+        /// - Err(Error): Failure reason
+        /// # Note
+        /// Caller must be counterparty and send required assets
         #[ink(message, payable)]
         pub fn accept_swap(&mut self, swap_id: u32) -> Result<(), Error> {
-            let swap = self.swaps.get(swap_id).ok_or(Error::SwapNotFound)?;
-            let caller = self.env().caller();
+            self.enter_reentrancy_guard()?;
+            let result = (|| {
+                let swap = self.swaps.get(swap_id).ok_or(Error::SwapNotFound)?;
+                let caller = self.env().caller();
 
-            // Ensure the caller is the counterparty
-            if caller != swap.counterparty {
-                return Err(Error::NotAuthorized);
-            }
+                // Authorization check
+                if caller != swap.counterparty {
+                    return Err(Error::NotAuthorized);
+                }
 
-            // Ensure the counterparty has transferred the correct amount
-            if self.env().transferred_value() != swap.counterparty_asset {
-                return Err(Error::InsufficientBalance);
-            }
+                // Validate counterparty's deposit
+                let transferred = self.env().transferred_value();
+                if transferred != swap.counterparty_asset {
+                    return Err(Error::InsufficientCounterpartyBalance);
+                }
 
-            // Transfer assets to both parties
-            self.env().transfer(swap.initiator, swap.counterparty_asset).map_err(|_| Error::InsufficientBalance)?;
-            self.env().transfer(swap.counterparty, swap.initiator_asset).map_err(|_| Error::InsufficientBalance)?;
+                // Execute asset exchange
+                self.transfer_funds(swap.initiator, transferred)?;
+                self.transfer_funds(swap.counterparty, swap.initiator_asset)?;
 
-            // Remove the swap from storage
-            self.swaps.remove(swap_id);
+                // Cleanup storage
+                self.swaps.remove(swap_id);
 
-            // Emit the SwapAccepted event
-            self.env().emit_event(SwapAccepted { swap_id });
+                self.emit_swap_accepted(swap_id);
 
-            Ok(())
+                Ok(())
+            })();
+            self.exit_reentrancy_guard();
+            result
         }
 
-        /// Cancels an existing swap
+        /// Cancels an existing swap agreement
+        /// # Arguments
+        /// - swap_id: ID of swap to cancel
+        /// # Returns
+        /// - Ok(()): Success
+        /// - Err(Error): Failure reason
         #[ink(message)]
         pub fn cancel_swap(&mut self, swap_id: u32) -> Result<(), Error> {
-            let swap = self.swaps.get(swap_id).ok_or(Error::SwapNotFound)?;
-            let caller = self.env().caller();
+            self.enter_reentrancy_guard()?;
+            let result = (|| {
+                let swap = self.swaps.get(swap_id).ok_or(Error::SwapNotFound)?;
+                let caller = self.env().caller();
 
-            // Ensure the caller is the initiator
-            if caller != swap.initiator {
-                return Err(Error::NotAuthorized);
+                // Authorization check
+                if caller != swap.initiator {
+                    return Err(Error::NotAuthorized);
+                }
+
+                // Return initiator's funds
+                self.transfer_funds(swap.initiator, swap.initiator_asset)?;
+
+                // Cleanup storage
+                self.swaps.remove(swap_id);
+
+                self.emit_swap_cancelled(swap_id);
+
+                Ok(())
+            })();
+            self.exit_reentrancy_guard();
+            result
+        }
+
+        fn enter_reentrancy_guard(&mut self) -> Result<(), Error> {
+            if self.reentrancy_guard {
+                return Err(Error::Reentrancy);
             }
-
-            // Return the assets to the initiator
-            self.env().transfer(swap.initiator, swap.initiator_asset).map_err(|_| Error::InsufficientBalance)?;
-
-            // Remove the swap from storage
-            self.swaps.remove(swap_id);
-
-            // Emit the SwapCancelled event
-            self.env().emit_event(SwapCancelled { swap_id });
-
+            self.reentrancy_guard = true;
             Ok(())
         }
+
+        fn exit_reentrancy_guard(&mut self) {
+            self.reentrancy_guard = false;
+        }
     }
+
     #[cfg(test)]
     mod tests {
         use super::*;
-        use ink::env::test;
+        use ink::env::{test, DefaultEnvironment};
+
+        /// # Swap Contract Test Suite
+        ///
+        /// This module contains comprehensive tests for the SwapContract,
+        /// covering core functionality, edge cases, and security requirements.
+        ///
+        /// ## Test Accounts Convention:
+        /// - Alice: Default caller/initiator (ink! default account)
+        /// - Bob: Counterparty account
+        /// - Charlie: Unauthorized third party
+        
+        /// Helper function to get test accounts
+        fn get_accounts() -> test::DefaultAccounts<DefaultEnvironment> {
+            test::default_accounts()
+        }
 
         #[ink::test]
-        fn test_initiate_swap() {
+        fn initiate_swap_works() {
             let mut contract = SwapContract::new();
-            let accounts = test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = get_accounts();
 
-            // Set the caller to the initiator
-            test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
-            // Set the transferred value
-            test::set_value_transferred::<ink::env::DefaultEnvironment>(100);
-
+            // Alice initiates swap
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            test::set_value_transferred::<DefaultEnvironment>(100);
+            
             let result = contract.initiate_swap(accounts.bob, 200);
             assert!(result.is_ok());
+            
             let swap_id = result.unwrap();
-            assert_eq!(swap_id, 0);
-
             let swap = contract.swaps.get(swap_id).unwrap();
+            
             assert_eq!(swap.initiator, accounts.alice);
             assert_eq!(swap.counterparty, accounts.bob);
             assert_eq!(swap.initiator_asset, 100);
@@ -185,84 +309,114 @@ mod swap_contract {
         }
 
         #[ink::test]
-        fn test_accept_swap() {
+        fn accept_swap_success() {
             let mut contract = SwapContract::new();
-            let accounts = test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = get_accounts();
 
-            // Set the caller to the initiator
-            test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
-            // Set the transferred value
-            test::set_value_transferred::<ink::env::DefaultEnvironment>(100);
-
+            // Setup swap
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            test::set_value_transferred::<DefaultEnvironment>(100);
             let swap_id = contract.initiate_swap(accounts.bob, 200).unwrap();
 
-            // Set the caller to the counterparty
-            test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
-            // Set the transferred value
-            test::set_value_transferred::<ink::env::DefaultEnvironment>(200);
-
-            let result = contract.accept_swap(swap_id);
-            assert!(result.is_ok());
+            // Bob accepts swap
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            test::set_value_transferred::<DefaultEnvironment>(200);
+            
+            assert!(contract.accept_swap(swap_id).is_ok());
+            assert!(contract.swaps.get(swap_id).is_none());
         }
 
         #[ink::test]
-        fn test_cancel_swap() {
+        fn cancel_swap_success() {
             let mut contract = SwapContract::new();
-            let accounts = test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = get_accounts();
 
-            // Set the caller to the initiator
-            test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
-            // Set the transferred value
-            test::set_value_transferred::<ink::env::DefaultEnvironment>(100);
-
+            // Setup swap
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            test::set_value_transferred::<DefaultEnvironment>(100);
             let swap_id = contract.initiate_swap(accounts.bob, 200).unwrap();
 
-            // Set the caller to the initiator
-            test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
-
-            let result = contract.cancel_swap(swap_id);
-            assert!(result.is_ok());
+            // Alice cancels swap
+            assert!(contract.cancel_swap(swap_id).is_ok());
+            assert!(contract.swaps.get(swap_id).is_none());
         }
 
         #[ink::test]
-        fn test_accept_swap_not_authorized() {
+        fn accept_swap_fails_wrong_counterparty() {
             let mut contract = SwapContract::new();
-            let accounts = test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = get_accounts();
 
-            // Set the caller to the initiator
-            test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
-            // Set the transferred value
-            test::set_value_transferred::<ink::env::DefaultEnvironment>(100);
-
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            test::set_value_transferred::<DefaultEnvironment>(100);
             let swap_id = contract.initiate_swap(accounts.bob, 200).unwrap();
 
-            // Set the caller to a different account
-            test::set_caller::<ink::env::DefaultEnvironment>(accounts.charlie);
-            // Set the transferred value
-            test::set_value_transferred::<ink::env::DefaultEnvironment>(200);
-
-            let result = contract.accept_swap(swap_id);
-            assert_eq!(result, Err(Error::NotAuthorized));
+            // Charlie tries to accept
+            test::set_caller::<DefaultEnvironment>(accounts.charlie);
+            test::set_value_transferred::<DefaultEnvironment>(200);
+            
+            assert_eq!(contract.accept_swap(swap_id), Err(Error::NotAuthorized));
         }
 
         #[ink::test]
-        fn test_cancel_swap_not_authorized() {
+        fn cancel_swap_fails_non_initiator() {
             let mut contract = SwapContract::new();
-            let accounts = test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = get_accounts();
 
-            // Set the caller to the initiator
-            test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
-            // Set the transferred value
-            test::set_value_transferred::<ink::env::DefaultEnvironment>(100);
-
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            test::set_value_transferred::<DefaultEnvironment>(100);
             let swap_id = contract.initiate_swap(accounts.bob, 200).unwrap();
 
-            // Set the caller to a different account
-            test::set_caller::<ink::env::DefaultEnvironment>(accounts.charlie);
+            // Bob tries to cancel
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            assert_eq!(contract.cancel_swap(swap_id), Err(Error::NotAuthorized));
+        }
 
-            let result = contract.cancel_swap(swap_id);
-            assert_eq!(result, Err(Error::NotAuthorized));
+        #[ink::test]
+        fn accept_swap_fails_insufficient_deposit() {
+            let mut contract = SwapContract::new();
+            let accounts = get_accounts();
+
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            test::set_value_transferred::<DefaultEnvironment>(100);
+            let swap_id = contract.initiate_swap(accounts.bob, 200).unwrap();
+
+            // Bob sends wrong amount
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            test::set_value_transferred::<DefaultEnvironment>(150);
+            
+            assert_eq!(contract.accept_swap(swap_id), Err(Error::InsufficientCounterpartyBalance));
+        }
+
+        #[ink::test]
+        fn initiate_swap_fails_zero_deposit() {
+            let mut contract = SwapContract::new();
+            let accounts = get_accounts();
+
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            test::set_value_transferred::<DefaultEnvironment>(0);
+            
+            assert_eq!(
+                contract.initiate_swap(accounts.bob, 200),
+                Err(Error::InsufficientInitiatorBalance)
+            );
+        }
+
+        #[ink::test]
+        fn double_accept_swap_fails() {
+            let mut contract = SwapContract::new();
+            let accounts = get_accounts();
+
+            // Setup and accept swap
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            test::set_value_transferred::<DefaultEnvironment>(100);
+            let swap_id = contract.initiate_swap(accounts.bob, 200).unwrap();
+
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            test::set_value_transferred::<DefaultEnvironment>(200);
+            contract.accept_swap(swap_id).unwrap();
+
+            // Try to accept again
+            assert_eq!(contract.accept_swap(swap_id), Err(Error::SwapNotFound));
         }
     }
-    
 }
